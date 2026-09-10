@@ -5,6 +5,16 @@ sair pela sua VPS, sem afetar o resto da internet do computador. Existem duas
 versões: uma para **Linux** e outra para **Windows**.
 
 ---
+# Disclaimer
+*NÃO* me responsabilizo pela disponibilidade de proxies de terceiros e nem por eventuais problemas na sua rede
+causados pelas configs (Extremamente difícil de acontecer, mas pode acontecer)
+*APENAS USE SE VOCÊ SABE O QUE ESTÁ FAZENDO OU TEM ALGUÉM QUE SABE TE GUIANDO*
+
+Todos os programas utilizados para a solução são _open source_, seus respectivos repositórios são:
+
+Shadow Socks: "https://github.com/shadowsocks"
+SocksCap64: "https://github.com/bobo2334/sockscap64"
+
 
 ## Linux
 
