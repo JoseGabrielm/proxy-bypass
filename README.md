@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Discord via proxy isolado (Shadowsocks + tun2socks + network namespace)
 
 Isso faz o Discord (texto, chamadas de voz, vídeo e compartilhamento de tela)
@@ -125,3 +126,7 @@ comando só, caso algo saia diferente do esperado.
   `iptables`/`iproute2` estão instalados (praticamente universais).
 - Se o caminho do executável do Discord for diferente do detectado por
   `which discord`, edite `DISCORD_BIN` em `run-discord.sh`.
+=======
+# proxy-bypass
+bypass do golive utilizando proxy privada
+>>>>>>> origin
