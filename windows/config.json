@@ -1,0 +1,62 @@
+{
+  "$schema": "https://sing-box.sagernet.org/schema.json",
+
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "singbox-tun",
+      "address": ["172.19.0.1/30"],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system"
+    },
+    {
+      "type": "mixed",
+      "tag": "proxy-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-out",
+      "server": "__SERVER_IP__",
+      "server_port": 8388,
+      "method": "chacha20-ietf-poly1305",
+      "password": "__SERVER_PASSWORD__"
+    },
+    {
+      "type": "direct",
+      "tag": "direct-out"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "inbound": "tun-in",
+        "action": "sniff"
+      },
+      {
+        "inbound": "proxy-in",
+        "action": "route",
+        "outbound": "shadowsocks-out"
+      },
+      {
+        "process_name": [
+          "Discord.exe",
+          "DiscordCanary.exe",
+          "DiscordDevelopment.exe"
+        ],
+        "action": "route",
+        "outbound": "shadowsocks-out"
+      },
+      {
+        "action": "route",
+        "outbound": "direct-out"
+      }
+    ]
+  }
+}

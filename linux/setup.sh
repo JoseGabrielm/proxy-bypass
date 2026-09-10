@@ -11,15 +11,15 @@
 # a qualquer momento para desfazer tudo caso algo pareca errado.
 #
 # Uso:
-#   1. Edite SERVER_PASSWORD abaixo.
+#   1. Edite SERVER_IP e SERVER_PASSWORD abaixo.
 #   2. sudo ./setup.sh
 #
 set -euo pipefail
 
 # ============================ CONFIGURACAO ============================
-SERVER_IP="2.25.217.51"
+SERVER_IP="SEU_IP_AQUI"
 SERVER_PORT="8388"
-SERVER_PASSWORD="2ca3fed59adbad4cc96710390a5c7f3598e758a9ddd27439"
+SERVER_PASSWORD="SUA_SENHA_AQUI"
 METHOD="chacha20-ietf-poly1305"
 
 NETNS_NAME="discord-ns"
@@ -54,6 +54,10 @@ die()  { echo -e "    \033[1;31m[ERRO]\033[0m $*"; exit 1; }
 if [[ $EUID -ne 0 ]]; then
     echo "Este script precisa de root (cria namespaces, interfaces e regras de firewall)."
     exec sudo -E "$0" "$@"
+fi
+
+if [[ "$SERVER_IP" == "SEU_IP_AQUI" ]]; then
+    die "Edite a variavel SERVER_IP no topo do script antes de rodar."
 fi
 
 if [[ "$SERVER_PASSWORD" == "SUA_SENHA_AQUI" ]]; then
