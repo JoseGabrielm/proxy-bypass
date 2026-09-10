@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Discord via proxy isolado (Shadowsocks + tun2socks + network namespace)
 
 Isso faz o Discord (texto, chamadas de voz, vídeo e compartilhamento de tela)
