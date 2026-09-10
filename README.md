@@ -127,6 +127,3 @@ comando só, caso algo saia diferente do esperado.
 - Se o caminho do executável do Discord for diferente do detectado por
   `which discord`, edite `DISCORD_BIN` em `run-discord.sh`.
 =======
-# proxy-bypass
-bypass do golive utilizando proxy privada
->>>>>>> origin
