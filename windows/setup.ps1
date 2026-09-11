@@ -2,9 +2,13 @@
 <#
     instalar-singbox-discord.ps1
     ------------------------------------------------------------
-    1. Baixa a versao mais recente do sing-box (Windows amd64)
+    1. Baixa o sing-box (versao travada no script, so baixa se ainda
+       nao existir sing-box.exe instalado em C:\Program Files\sing-box)
     2. Le o .\config.json que voce preparou (TUN + regra: so o Discord
-       sai pela proxy) e pergunta IP / porta / senha do Shadowsocks
+       sai pela proxy) e abre uma pagina no navegador padrao para
+       informar IP / porta / senha do Shadowsocks (a pagina testa a
+       conexao real com o servidor antes de aceitar os dados, sem
+       tocar em nenhuma configuracao de rede do Windows)
     3. Altera o config.json com esses dados (e habilita a Clash API
        em 127.0.0.1 so para os testes)
     4. Instala em C:\Program Files\sing-box e registra uma tarefa
@@ -31,7 +35,9 @@ param(
     [string]$InstallDir = "$env:ProgramFiles\sing-box",
     [string]$TaskName   = "sing-box",
     [int]$ClashApiPort  = 9090,
-    [switch]$SkipDownload,
+    [string]$SingBoxVersion = "1.14.0",     # versao travada: so muda revisando este valor
+    [switch]$ForceReinstall,                # baixa e sobrescreve mesmo se ja houver sing-box.exe instalado
+    [switch]$SkipDownload,                  # nao baixa nada; usa o exe ja instalado (falha se nao existir)
     [switch]$Monitor,       # so monitora: trafego + status da rede, ate fechar a janela (Ctrl+C)
     [switch]$Logs,          # so monitora: log do sing-box em tempo real, formatado
     [switch]$WebUI,         # abre interface web no navegador em vez de perguntar no terminal
@@ -49,19 +55,81 @@ function Write-Warn2 ($msg) { Write-Host "    [AVISO] $msg" -ForegroundColor Yel
 function Write-Fail  ($msg) { Write-Host "    [FALHA] $msg" -ForegroundColor Red }
 
 function Get-PublicIp {
-    param([string]$SocksProxy)   # ex: 127.0.0.1:1080  (opcional)
+    param([string]$SocksProxy, [int]$TimeoutSec = 10)   # ex: 127.0.0.1:1080  (opcional)
     $urls = @("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")
     foreach ($u in $urls) {
         try {
             if ($SocksProxy) {
-                $r = & curl.exe -s --max-time 10 --proxy "socks5h://$SocksProxy" $u 2>$null
+                $r = & curl.exe -s --max-time $TimeoutSec --proxy "socks5h://$SocksProxy" $u 2>$null
             } else {
-                $r = & curl.exe -s --max-time 10 $u 2>$null
+                $r = & curl.exe -s --max-time $TimeoutSec $u 2>$null
             }
             if ($r -and $r.Trim() -match '^\d{1,3}(\.\d{1,3}){3}$') { return $r.Trim() }
         } catch { }
     }
     return $null
+}
+
+# Sobe uma instancia isolada do sing-box (sem TUN, sem tocar rede do Windows)
+# so para validar se IP/porta/senha do Shadowsocks realmente conectam,
+# ANTES de instalar/iniciar a tarefa com TUN em strict_route.
+function Test-ShadowsocksConnection {
+    param(
+        [string]$ExePath,
+        [string]$Method,
+        [string]$Server,
+        [int]$Port,
+        [string]$Password,
+        [string]$WorkDir
+    )
+
+    $testPort = 0
+    foreach ($p in 18080..18090) {
+        $probe = $null
+        try {
+            $probe = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $p)
+            $probe.Start()
+            $testPort = $p
+        } catch { }
+        finally { if ($probe) { $probe.Stop() } }
+        if ($testPort) { break }
+    }
+    if (-not $testPort) { return $false }
+
+    $testConfig = [pscustomobject]@{
+        outbounds = @([pscustomobject]@{
+            type        = "shadowsocks"
+            tag         = "ss-test"
+            server      = $Server
+            server_port = $Port
+            method      = $Method
+            password    = $Password
+        })
+        inbounds = @([pscustomobject]@{
+            type        = "mixed"
+            tag         = "test-in"
+            listen      = "127.0.0.1"
+            listen_port = $testPort
+        })
+        route = [pscustomobject]@{ final = "ss-test" }
+    } | ConvertTo-Json -Depth 10
+
+    $testConfigPath = Join-Path $WorkDir "test-config.json"
+    [IO.File]::WriteAllText($testConfigPath, $testConfig, (New-Object Text.UTF8Encoding($false)))
+
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $ExePath -ArgumentList "run -c `"$testConfigPath`"" `
+                    -WindowStyle Hidden -PassThru
+        Start-Sleep -Milliseconds 800
+        if ($proc.HasExited) { return $false }
+
+        $ip = Get-PublicIp -SocksProxy "127.0.0.1:$testPort" -TimeoutSec 6
+        return [bool]$ip
+    } finally {
+        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+        Remove-Item $testConfigPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 
@@ -72,6 +140,210 @@ function Format-Bytes ([double]$b) {
     return "{0:N0} B" -f $b
 }
 function Format-Rate ([double]$bps) { return (Format-Bytes $bps) + "/s" }
+
+# Sobe um servidor HTTP local, abre uma pagina no navegador padrao pedindo
+# IP/porta/senha do Shadowsocks (com validacao no navegador e no servidor,
+# incluindo um teste real de conexao antes de aceitar os dados).
+# e bloqueia ate receber os dados. Devolve @{ Ip; Port; Pass }.
+function Get-ProxyCredentialsViaBrowser {
+    param(
+        [string]$CurrentIp,
+        [int]$CurrentPort,
+        [string]$CurrentPassword,   # usada so para testar a conexao quando o campo senha fica em branco
+        [string]$ExePath,           # sing-box.exe usado para o teste isolado (sem TUN)
+        [string]$Method,            # metodo Shadowsocks (ssOut.method)
+        [string]$WorkDir            # pasta temporaria para o config de teste
+    )
+
+    $HasCurrentPassword = [bool]$CurrentPassword
+    Add-Type -AssemblyName System.Web
+
+    $listener = $null
+    $usedPort = $null
+    foreach ($p in 8765..8774) {
+        $l = New-Object System.Net.HttpListener
+        $l.Prefixes.Add("http://127.0.0.1:$p/")
+        try {
+            $l.Start()
+            $listener = $l
+            $usedPort = $p
+            break
+        } catch { }
+    }
+    if (-not $listener) { throw "Nao consegui abrir um servidor local (portas 8765-8774 ocupadas)" }
+
+    $passNote = if ($HasCurrentPassword) { " (deixe em branco para manter a atual)" } else { "" }
+    $hasPassJs = if ($HasCurrentPassword) { "true" } else { "false" }
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<title>Dados da proxy Shadowsocks</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 420px; margin: 60px auto; padding: 0 16px; background:#111; color:#eee; }
+  label { display:block; margin-top: 16px; font-size: 14px; }
+  input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; background:#222; color:#eee; border:1px solid #444; border-radius:4px; font-size:14px; }
+  button { margin-top: 24px; padding: 10px 20px; width: 100%; background:#4c8bf5; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:15px; }
+  button:hover { background:#3a76e0; }
+  .err { color:#ff6b6b; font-size: 13px; margin-top: 4px; min-height: 16px; }
+  h2 { text-align:center; }
+</style>
+</head>
+<body>
+<h2>Dados da proxy Shadowsocks</h2>
+<form id="f" novalidate>
+  <label>IP/host do servidor
+    <input id="ip" name="ip" value="$CurrentIp" autocomplete="off">
+  </label>
+  <div class="err" id="errIp"></div>
+
+  <label>Porta
+    <input id="port" name="port" value="$CurrentPort" autocomplete="off">
+  </label>
+  <div class="err" id="errPort"></div>
+
+  <label>Senha$passNote
+    <input id="pass" name="pass" type="text" autocomplete="off">
+  </label>
+  <div class="err" id="errPass"></div>
+
+  <div class="err" id="errGeneral" style="margin-top:12px"></div>
+  <button type="submit" id="btn">Salvar e continuar</button>
+</form>
+<script>
+var hasCurrentPass = $hasPassJs;
+var form = document.getElementById('f');
+var btn = document.getElementById('btn');
+
+form.addEventListener('submit', function (e) {
+  e.preventDefault();
+  var ip = document.getElementById('ip').value.trim();
+  var port = document.getElementById('port').value.trim();
+  var pass = document.getElementById('pass').value.replace(/\s+/g, '');
+  var ok = true;
+  document.getElementById('errIp').textContent = '';
+  document.getElementById('errPort').textContent = '';
+  document.getElementById('errPass').textContent = '';
+  document.getElementById('errGeneral').textContent = '';
+
+  if (!ip) { document.getElementById('errIp').textContent = 'Informe o IP ou host.'; ok = false; }
+
+  var portNum = Number(port);
+  if (!port || !Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+    document.getElementById('errPort').textContent = 'Porta invalida (1-65535).';
+    ok = false;
+  }
+
+  if (!pass && !hasCurrentPass) {
+    document.getElementById('errPass').textContent = 'Informe a senha.';
+    ok = false;
+  }
+
+  if (!ok) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Testando conexao com o servidor...';
+
+  fetch('/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'ip=' + encodeURIComponent(ip) + '&port=' + encodeURIComponent(port) + '&pass=' + encodeURIComponent(pass)
+  }).then(function (r) {
+    return r.text().then(function (text) { return { ok: r.ok, text: text }; });
+  }).then(function (res) {
+    if (res.ok) {
+      document.body.innerHTML = '<h2>Conectado! Pode fechar esta aba e voltar ao PowerShell.</h2>';
+      return;
+    }
+    btn.disabled = false;
+    btn.textContent = 'Salvar e continuar';
+    if (res.text === 'AUTH_FAILED') {
+      document.getElementById('errGeneral').textContent = 'Nao consegui conectar nesse servidor com esses dados. Confira IP, porta e senha, e tente de novo.';
+    } else {
+      document.getElementById('errGeneral').textContent = 'Dados invalidos, confira os campos.';
+    }
+  }).catch(function () {
+    btn.disabled = false;
+    btn.textContent = 'Salvar e continuar';
+    document.getElementById('errGeneral').textContent = 'Erro ao enviar. Tente novamente.';
+  });
+});
+</script>
+</body>
+</html>
+"@
+    $htmlBytes = [Text.Encoding]::UTF8.GetBytes($html)
+
+    $url = "http://127.0.0.1:$usedPort/"
+    Write-Host "    Pagina: $url  (abrindo no navegador padrao...)"
+    try { Start-Process $url | Out-Null } catch { Write-Warn2 "Nao consegui abrir o navegador automaticamente. Acesse: $url" }
+
+    $result = $null
+    try {
+        while (-not $result) {
+            $context  = $listener.GetContext()
+            $request  = $context.Request
+            $response = $context.Response
+
+            if ($request.HttpMethod -eq "GET" -and $request.Url.AbsolutePath -eq "/") {
+                $response.ContentType = "text/html; charset=utf-8"
+                $response.ContentLength64 = $htmlBytes.Length
+                $response.OutputStream.Write($htmlBytes, 0, $htmlBytes.Length)
+                $response.OutputStream.Close()
+            }
+            elseif ($request.HttpMethod -eq "POST" -and $request.Url.AbsolutePath -eq "/submit") {
+                $reader = New-Object IO.StreamReader($request.InputStream, $request.ContentEncoding)
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+
+                $parsed  = [Web.HttpUtility]::ParseQueryString($body)
+                $ip      = $parsed["ip"]
+                $portStr = $parsed["port"]
+                $pass    = [string]$parsed["pass"] -replace '\s+', ''
+
+                $portVal = 0
+                $formatValid = $ip -and [int]::TryParse($portStr, [ref]$portVal) -and $portVal -ge 1 -and $portVal -le 65535 `
+                               -and ($pass -or $HasCurrentPassword)
+
+                $status = "INVALID"
+                if ($formatValid) {
+                    $testPass = if ($pass) { $pass } else { $CurrentPassword }
+                    Write-Host "    Testando conexao com $ip`:$portVal (sem alterar a rede do Windows)..."
+                    $connOk = Test-ShadowsocksConnection -ExePath $ExePath -Method $Method `
+                                -Server $ip -Port $portVal -Password $testPass -WorkDir $WorkDir
+                    if ($connOk) {
+                        $status = "OK"
+                        Write-Ok "Conexao com $ip`:$portVal confirmada"
+                    } else {
+                        $status = "AUTH_FAILED"
+                        Write-Warn2 "Nao consegui conectar em $ip`:$portVal com os dados informados - pedindo de novo na pagina"
+                    }
+                }
+
+                $respBytes = [Text.Encoding]::UTF8.GetBytes($status)
+                $response.StatusCode = if ($status -eq "OK") { 200 } else { 400 }
+                $response.ContentLength64 = $respBytes.Length
+                $response.OutputStream.Write($respBytes, 0, $respBytes.Length)
+                $response.OutputStream.Close()
+
+                if ($status -eq "OK") {
+                    $result = [pscustomobject]@{ Ip = $ip; Port = $portVal; Pass = $pass }
+                }
+            }
+            else {
+                $response.StatusCode = 404
+                $response.OutputStream.Close()
+            }
+        }
+    } finally {
+        $listener.Stop()
+        $listener.Close()
+    }
+
+    return $result
+}
 
 # Le config.json instalado para descobrir porta da Clash API, tag da proxy e nome da TUN
 function Get-InstalledConfigInfo {
@@ -111,8 +383,16 @@ function Start-TrafficMonitor {
         # --- status do processo / tarefa
         $proc = Get-Process sing-box -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($proc) {
-            $up = $now - $proc.StartTime
-            [void]$sb.AppendLine(("  sing-box   : RODANDO  PID {0}  ha {1:d\.hh\:mm\:ss}  RAM {2}" -f $proc.Id, $up, (Format-Bytes $proc.WorkingSet64)))
+            # StartTime nao e legivel sem elevacao quando o sing-box roda como SYSTEM
+            # (tarefa agendada) - vira $null e "$now - $null" estoura. Mostra "?" nesse caso.
+            $upStr = "?"
+            try {
+                $st = $proc.StartTime
+                if ($st) { $upStr = "{0:d\.hh\:mm\:ss}" -f ($now - $st) }
+            } catch { }
+            $ramStr = "?"
+            try { $ramStr = Format-Bytes $proc.WorkingSet64 } catch { }
+            [void]$sb.AppendLine(("  sing-box   : RODANDO  PID {0}  ha {1}  RAM {2}" -f $proc.Id, $upStr, $ramStr))
         } else {
             [void]$sb.AppendLine("  sing-box   : PARADO")
         }
@@ -711,19 +991,41 @@ $tmp = Join-Path $env:ProgramData "sing-box-setup"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $zipPath = Join-Path $tmp "sing-box.zip"
 
-if (-not $SkipDownload) {
-    Write-Step "Baixando a versao mais recente do sing-box"
+$installedExePath = Join-Path $InstallDir "sing-box.exe"
+$alreadyInstalled = Test-Path $installedExePath
+
+Write-Step "Verificando sing-box (versao travada: $SingBoxVersion)"
+if ($SkipDownload) {
+    if (-not $alreadyInstalled) { throw "sing-box.exe nao encontrado em $installedExePath e -SkipDownload foi usado" }
+    Write-Ok "Pulando download (-SkipDownload) - usando $installedExePath"
+}
+elseif ($alreadyInstalled -and -not $ForceReinstall) {
+    $installedVersion = $null
+    try {
+        $verOut = & $installedExePath version 2>$null
+        if ($verOut -match 'version\s+([\d.]+)') { $installedVersion = $Matches[1] }
+    } catch { }
+    Write-Ok "sing-box ja instalado em $installedExePath$(if ($installedVersion) { " (versao $installedVersion)" })"
+    if ($installedVersion -and $installedVersion -ne $SingBoxVersion) {
+        Write-Warn2 "Versao instalada ($installedVersion) difere da travada no script ($SingBoxVersion). Mantendo a instalada - use -ForceReinstall para trocar."
+    }
+}
+else {
+    if ($ForceReinstall) { Write-Host "    -ForceReinstall: baixando de novo mesmo ja instalado" }
+    Write-Host "    Baixando sing-box v$SingBoxVersion"
     $arch = if ([Environment]::Is64BitOperatingSystem) {
         if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "windows-arm64" } else { "windows-amd64" }
     } else { "windows-386" }
 
-    $release = Invoke-RestMethod "https://api.github.com/repos/SagerNet/sing-box/releases/latest" `
-                -Headers @{ "User-Agent" = "singbox-installer" }
-    $asset = $release.assets | Where-Object { $_.name -like "sing-box-*-$arch.zip" } | Select-Object -First 1
-    if (-not $asset) { throw "Nao achei o asset $arch na release $($release.tag_name)" }
+    $assetName   = "sing-box-$SingBoxVersion-$arch.zip"
+    $downloadUrl = "https://github.com/SagerNet/sing-box/releases/download/v$SingBoxVersion/$assetName"
 
-    Write-Host "    Versao: $($release.tag_name)  |  Arquivo: $($asset.name)"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
+    Write-Host "    Arquivo: $assetName"
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+    } catch {
+        throw "Falha ao baixar $downloadUrl (a versao $SingBoxVersion existe para $arch ?): $($_.Exception.Message)"
+    }
     Write-Ok "Download concluido"
 
     Write-Step "Extraindo"
@@ -777,21 +1079,17 @@ $curPass = [string]$ssOut.password
 if ($curIp   -like "__*__") { $curIp   = "" }
 if ($curPass -like "__*__") { $curPass = "" }
 
-do {
-    $ipIn = if ($curIp) { Read-Host "  IP/host do servidor [$curIp]" } else { Read-Host "  IP/host do servidor" }
-    $proxyIp = if ($ipIn.Trim()) { $ipIn.Trim() } else { $curIp }
-} while (-not $proxyIp)
+$testExePath = if ($exeSrc) { $exeSrc.FullName } else { Join-Path $InstallDir "sing-box.exe" }
+if (-not (Test-Path $testExePath)) {
+    throw "sing-box.exe nao encontrado para testar a conexao"
+}
 
-$portIn = Read-Host "  Porta [$($ssOut.server_port)]"
-$proxyPort = if ($portIn.Trim()) { [int]$portIn } else { [int]$ssOut.server_port }
-
-do {
-    $label = if ($curPass) { "  Senha [ENTER mantem a do arquivo]" } else { "  Senha" }
-    $sec = Read-Host $label -AsSecureString
-    $proxyPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
-    if (-not $proxyPass) { $proxyPass = $curPass }
-} while (-not $proxyPass)
+$cred = Get-ProxyCredentialsViaBrowser -CurrentIp $curIp -CurrentPort ([int]$ssOut.server_port) `
+            -CurrentPassword $curPass -ExePath $testExePath -Method $ssOut.method -WorkDir $tmp
+$proxyIp   = $cred.Ip
+$proxyPort = $cred.Port
+$proxyPass = if ($cred.Pass) { $cred.Pass } else { $curPass }
+Write-Ok "Dados recebidos e conexao com o servidor confirmada"
 
 # ---------------------------------------------------------------- 3. alterar config.json
 Write-Step "Alterando config.json"
@@ -837,8 +1135,8 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $exePath    = Join-Path $InstallDir "sing-box.exe"
 $configPath = Join-Path $InstallDir "config.json"
 
-if (-not $SkipDownload) { Copy-Item $exeSrc.FullName $exePath -Force }
-if (-not (Test-Path $exePath)) { throw "sing-box.exe nao esta em $InstallDir (rode sem -SkipDownload)" }
+if ($exeSrc) { Copy-Item $exeSrc.FullName $exePath -Force }
+if (-not (Test-Path $exePath)) { throw "sing-box.exe nao esta em $InstallDir" }
 
 # "importar" o config: valida antes de copiar para a pasta de instalacao
 Write-Step "Validando e importando config.json"
