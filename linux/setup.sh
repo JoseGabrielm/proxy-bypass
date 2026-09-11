@@ -17,9 +17,9 @@
 set -euo pipefail
 
 # ============================ CONFIGURACAO ============================
-SERVER_IP="SEU_IP_AQUI"
-SERVER_PORT="8388"
-SERVER_PASSWORD="SUA_SENHA_AQUI"
+SERVER_IP="${PROXY_IP:-SEU_IP_AQUI}"
+SERVER_PORT="${PROXY_PORT:-8388}"
+SERVER_PASSWORD="${PROXY_PASSWORD:-SUA_SENHA_AQUI}"
 METHOD="chacha20-ietf-poly1305"
 
 NETNS_NAME="discord-ns"

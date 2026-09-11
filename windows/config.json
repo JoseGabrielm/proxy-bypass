@@ -22,10 +22,10 @@
     {
       "type": "shadowsocks",
       "tag": "shadowsocks-out",
-      "server": "__SERVER_IP__",
+      "server": "2.25.217.51",
       "server_port": 8388,
       "method": "chacha20-ietf-poly1305",
-      "password": "__SERVER_PASSWORD__"
+      "password": "2ca3fed59adbad4cc96710390a5c7f3598e758a9ddd27439"
     },
     {
       "type": "direct",

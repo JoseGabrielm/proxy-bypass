@@ -33,7 +33,10 @@ param(
     [int]$ClashApiPort  = 9090,
     [switch]$SkipDownload,
     [switch]$Monitor,       # so monitora: trafego + status da rede, ate fechar a janela (Ctrl+C)
-    [switch]$Logs           # so monitora: log do sing-box em tempo real, formatado
+    [switch]$Logs,          # so monitora: log do sing-box em tempo real, formatado
+    [switch]$WebUI,         # abre interface web no navegador em vez de perguntar no terminal
+    [int]$WebPort = 19800,  # porta do servidor HTTP local para a WebUI
+    [switch]$SkipAdminCheck # Pula verificacao de admin (util para testes)
 )
 
 $ErrorActionPreference = "Stop"
@@ -262,17 +265,435 @@ function Start-LogMonitor {
 if ($Monitor) { Start-TrafficMonitor; exit 0 }
 if ($Logs)    { Start-LogMonitor;     exit 0 }
 
-# ---------------------------------------------------------------- 0. admin
-Write-Step "Verificando privilegios"
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Warn2 "Nao esta como administrador. Reabrindo com elevacao..."
-    $args = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $args
-    exit
+# ---------------------------------------------------------------- modo -WebUI (funcoes + dispatcher)
+
+# Helpers do servidor HTTP
+function Read-RequestBody ($req) {
+    $reader = New-Object IO.StreamReader($req.InputStream, $req.ContentEncoding)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+    return ($body | ConvertFrom-Json)
 }
-Write-Ok "Rodando como administrador"
+
+function Send-JsonResponse ($res, $obj, [int]$status = 200) {
+    $json = $obj | ConvertTo-Json -Depth 10 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    $res.StatusCode = $status
+    $res.ContentType = "application/json; charset=utf-8"
+    $res.ContentLength64 = $bytes.Length
+    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+    $res.Close()
+}
+
+function Send-SSE ($writer, [string]$event, $data) {
+    $json = $data | ConvertTo-Json -Depth 10 -Compress
+    $writer.WriteLine("event: $event")
+    $writer.WriteLine("data: $json")
+    $writer.WriteLine("")
+    $writer.Flush()
+}
+
+function Get-InstallStatus {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $proc = Get-Process sing-box -ErrorAction SilentlyContinue | Select-Object -First 1
+    $installed = $null -ne $task
+    $running = $null -ne $proc
+
+    $proxyInfo = $null
+    $cfgPath = Join-Path $InstallDir "config.json"
+    if ($installed -and (Test-Path $cfgPath)) {
+        try {
+            $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $ss = @($cfg.outbounds | Where-Object { $_.type -eq "shadowsocks" }) | Select-Object -First 1
+            if ($ss) {
+                $proxyInfo = @{ ip = $ss.server; port = [int]$ss.server_port }
+            }
+        } catch { }
+    }
+
+    return @{ installed = $installed; running = $running; proxyInfo = $proxyInfo }
+}
+
+# Executa instalacao completa, enviando progresso via SSE
+function Invoke-WebInstall ($res, $data) {
+    $res.ContentType = "text/event-stream"
+    $res.Headers.Add("Cache-Control", "no-cache")
+    $res.Headers.Add("X-Accel-Buffering", "no")
+    $writer = New-Object IO.StreamWriter($res.OutputStream, (New-Object Text.UTF8Encoding($false)))
+    $writer.AutoFlush = $true
+
+    $proxyIp   = $data.ip
+    $proxyPort = [int]$data.port
+    $proxyPass = $data.password
+    $autoStart = if ($null -eq $data.autostart) { $true } else { $data.autostart }
+
+    $ipLocal   = $null
+    $ipProxy   = $null
+    $discordStatus = "not-checked"
+
+    try {
+        # ---- STEP 1: Download ----
+        Send-SSE $writer "step" @{ id = "download"; status = "running"; message = "Buscando versao mais recente..." }
+
+        $tmp = Join-Path $env:ProgramData "sing-box-setup"
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        $zipPath = Join-Path $tmp "sing-box.zip"
+
+        $arch = if ([Environment]::Is64BitOperatingSystem) {
+            if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "windows-arm64" } else { "windows-amd64" }
+        } else { "windows-386" }
+
+        $release = Invoke-RestMethod "https://api.github.com/repos/SagerNet/sing-box/releases/latest" `
+                    -Headers @{ "User-Agent" = "singbox-installer" }
+        $asset = $release.assets | Where-Object { $_.name -like "sing-box-*-$arch.zip" } | Select-Object -First 1
+        if (-not $asset) { throw "Nao achei o asset $arch na release $($release.tag_name)" }
+
+        Send-SSE $writer "step" @{ id = "download"; status = "running"; message = "Baixando $($asset.name)... pode levar um minuto" }
+
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
+
+        $extract = Join-Path $tmp "extract"
+        if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extract)
+        $exeSrc = Get-ChildItem $extract -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+        if (-not $exeSrc) { throw "sing-box.exe nao encontrado dentro do zip" }
+
+        Send-SSE $writer "step" @{ id = "download"; status = "done"; message = "$($release.tag_name) baixado" }
+
+        # ---- STEP 2: Config ----
+        Send-SSE $writer "step" @{ id = "config"; status = "running"; message = "Preparando config.json..." }
+
+        $scriptDir = Split-Path -Parent $PSCommandPath
+        $cfgSrc = $ConfigFile
+        if (-not $cfgSrc) {
+            $c = Join-Path $scriptDir "config.json"
+            if (Test-Path $c) { $cfgSrc = $c }
+        }
+        if (-not $cfgSrc -or -not (Test-Path $cfgSrc)) {
+            throw "config.json nao encontrado. Coloque-o na mesma pasta do script."
+        }
+        $cfgSrc = (Resolve-Path $cfgSrc).Path
+
+        $config = Get-Content $cfgSrc -Raw -Encoding UTF8 | ConvertFrom-Json
+        $ssOut = @($config.outbounds | Where-Object { $_.type -eq "shadowsocks" }) | Select-Object -First 1
+        if (-not $ssOut) { throw "Nenhum outbound do tipo 'shadowsocks' no config.json" }
+        $tunIn = @($config.inbounds | Where-Object { $_.type -eq "tun" }) | Select-Object -First 1
+        if (-not $tunIn) { throw "Nenhum inbound do tipo 'tun' no config.json" }
+        $proxyTag = $ssOut.tag
+        $tunName  = if ($tunIn.interface_name) { $tunIn.interface_name } else { "sing-box" }
+        $socksIn  = @($config.inbounds | Where-Object { $_.type -in @("mixed", "socks") }) | Select-Object -First 1
+        $SocksPort = if ($socksIn) { [int]$socksIn.listen_port } else { 0 }
+
+        # Preencher dados da proxy
+        $ssOut.server      = $proxyIp
+        $ssOut.server_port = $proxyPort
+        $ssOut.password    = $proxyPass
+
+        # Clash API
+        if (-not $config.PSObject.Properties["experimental"]) {
+            $config | Add-Member -NotePropertyName experimental -NotePropertyValue ([pscustomobject]@{})
+        }
+        if (-not $config.experimental.PSObject.Properties["clash_api"]) {
+            $config.experimental | Add-Member -NotePropertyName clash_api `
+                -NotePropertyValue ([pscustomobject]@{ external_controller = "127.0.0.1:$ClashApiPort" })
+        } else {
+            $ClashApiPort = [int](($config.experimental.clash_api.external_controller -split ":")[-1])
+        }
+
+        # Log em arquivo
+        if (-not $config.PSObject.Properties["log"]) {
+            $config | Add-Member -NotePropertyName log -NotePropertyValue ([pscustomobject]@{ level = "info"; timestamp = $true; output = "sing-box.log" })
+        } elseif (-not $config.log.PSObject.Properties["output"]) {
+            $config.log | Add-Member -NotePropertyName output -NotePropertyValue "sing-box.log"
+        }
+
+        $configJson = $config | ConvertTo-Json -Depth 20
+        $configTmp  = Join-Path $tmp "config.json"
+        [IO.File]::WriteAllText($configTmp, $configJson, (New-Object Text.UTF8Encoding($false)))
+
+        Send-SSE $writer "step" @{ id = "config"; status = "done"; message = "Config pronto: $proxyIp`:$proxyPort" }
+
+        # ---- STEP 3: Install ----
+        Send-SSE $writer "step" @{ id = "install"; status = "running"; message = "Parando instancia anterior..." }
+
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        }
+        Get-Process sing-box -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep 1
+
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        $exePath    = Join-Path $InstallDir "sing-box.exe"
+        $configPath = Join-Path $InstallDir "config.json"
+
+        Copy-Item $exeSrc.FullName $exePath -Force
+
+        Send-SSE $writer "step" @{ id = "install"; status = "running"; message = "Validando config..." }
+        $check = & $exePath check -c $configTmp 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "config.json invalido: $($check -join ' ')"
+        }
+        Copy-Item $configTmp $configPath -Force
+
+        Send-SSE $writer "step" @{ id = "install"; status = "running"; message = "Registrando tarefa agendada..." }
+        $action    = New-ScheduledTaskAction -Execute $exePath -Argument "run -c `"$configPath`"" -WorkingDirectory $InstallDir
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                        -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        
+        if ($autoStart) {
+            $trigger   = New-ScheduledTaskTrigger -AtStartup
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
+                -Settings $settings -Force | Out-Null
+        } else {
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal `
+                -Settings $settings -Force | Out-Null
+
+            $WshShell = New-Object -ComObject WScript.Shell
+            $shortcutPath = "$([Environment]::GetFolderPath('Desktop'))\Discord Proxy.lnk"
+            $Shortcut = $WshShell.CreateShortcut($shortcutPath)
+            $Shortcut.TargetPath = "schtasks.exe"
+            $Shortcut.Arguments = "/run /tn `"$TaskName`""
+            $Shortcut.WindowStyle = 7
+            $Shortcut.IconLocation = "$exePath,0"
+            $Shortcut.Description = "Iniciar Proxy do Discord"
+            $Shortcut.Save()
+        }
+
+        Send-SSE $writer "step" @{ id = "install"; status = "done"; message = "Instalado em $InstallDir" }
+
+        # ---- STEP 4: Start ----
+        Send-SSE $writer "step" @{ id = "start"; status = "running"; message = "Iniciando sing-box..." }
+
+        Start-ScheduledTask -TaskName $TaskName
+
+        $started = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Get-Process sing-box -ErrorAction SilentlyContinue) {
+                try {
+                    Invoke-RestMethod "http://127.0.0.1:$ClashApiPort/version" -TimeoutSec 2 | Out-Null
+                    $started = $true; break
+                } catch { }
+            }
+        }
+        if (-not $started) {
+            throw "sing-box nao subiu. Veja $InstallDir\sing-box.log"
+        }
+
+        # Reset Discord se aberto
+        $discordRunning = Get-Process | Where-Object { $_.ProcessName -like "Discord*" }
+        if ($discordRunning) {
+            Send-SSE $writer "step" @{ id = "start"; status = "running"; message = "Reiniciando Discord..." }
+            $discordExe = $null
+            try { $discordExe = ($discordRunning | Where-Object { $_.Path } | Select-Object -First 1).Path } catch { }
+            if (-not $discordExe) {
+                $upd = Join-Path $env:LOCALAPPDATA "Discord\Update.exe"
+                if (Test-Path $upd) { $discordExe = $upd }
+            }
+            $discordRunning | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 3
+            if ($discordExe) {
+                if ($discordExe -like "*Update.exe") {
+                    Start-Process $discordExe -ArgumentList "--processStart Discord.exe"
+                } else {
+                    Start-Process explorer.exe -ArgumentList "`"$discordExe`""
+                }
+                Start-Sleep 5
+            }
+        }
+
+        Send-SSE $writer "step" @{ id = "start"; status = "done"; message = "sing-box rodando (PID $((Get-Process sing-box).Id -join ','))" }
+
+        # ---- COMPLETE ----
+        Send-SSE $writer "complete" @{
+            installDir = $InstallDir
+        }
+
+    } catch {
+        try { Send-SSE $writer "error" @{ message = $_.Exception.Message } } catch { }
+    } finally {
+        try { $writer.Close() } catch { }
+        try { $res.Close() } catch { }
+    }
+}
+
+function Start-WebSetup {
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $htmlPath  = Join-Path $scriptDir "..\ui\index.html"
+    if (-not (Test-Path $htmlPath)) {
+        Write-Fail "..\ui\index.html nao encontrado em $scriptDir"
+        return
+    }
+
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add("http://localhost:$WebPort/")
+    try { $listener.Start() }
+    catch {
+        Write-Fail "Nao foi possivel iniciar o servidor em localhost:$WebPort - $($_.Exception.Message)"
+        return
+    }
+
+    Write-Step "Interface web rodando em http://localhost:$WebPort/"
+    Write-Host "    O navegador abrira automaticamente."
+    Write-Host "    Feche esta janela ou pressione Ctrl+C para encerrar.`n"
+    
+    # ABRE O NAVEGADOR AUTOMATICAMENTE NO WINDOWS
+    Start-Process "http://localhost:$WebPort/"
+
+    try {
+        while ($listener.IsListening) {
+            $context = $null
+            try { $context = $listener.GetContext() }
+            catch [System.Net.HttpListenerException] { break }  # listener parou
+
+            $req = $context.Request
+            $res = $context.Response
+            $path   = $req.Url.AbsolutePath
+            $method = $req.HttpMethod
+
+            # CORS para mesma origem, nao necessario mas nao atrapalha
+            $res.Headers.Add("Access-Control-Allow-Origin", "*")
+
+            try {
+                if ($method -eq "GET" -and $path -eq "/") {
+                    # Servir pagina HTML
+                    $html  = [IO.File]::ReadAllText($htmlPath, [Text.Encoding]::UTF8)
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($html)
+                    $res.ContentType = "text/html; charset=utf-8"
+                    $res.ContentLength64 = $bytes.Length
+                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                    $res.Close()
+                }
+                elseif ($method -eq "GET" -and $path -eq "/style.css") {
+                    $cssPath = Join-Path $scriptDir "..\ui\style.css"
+                    $css  = [IO.File]::ReadAllText($cssPath, [Text.Encoding]::UTF8)
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($css)
+                    $res.ContentType = "text/css; charset=utf-8"
+                    $res.ContentLength64 = $bytes.Length
+                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                    $res.Close()
+                }
+                elseif ($method -eq "GET" -and $path -eq "/script.js") {
+                    $jsPath = Join-Path $scriptDir "..\ui\script.js"
+                    $js  = [IO.File]::ReadAllText($jsPath, [Text.Encoding]::UTF8)
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($js)
+                    $res.ContentType = "application/javascript; charset=utf-8"
+                    $res.ContentLength64 = $bytes.Length
+                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                    $res.Close()
+                }
+                elseif ($method -eq "GET" -and $path -eq "/api/status") {
+                    $status = Get-InstallStatus
+                    Send-JsonResponse $res $status
+                }
+                elseif ($method -eq "POST" -and $path -eq "/api/test") {
+                    $data = Read-RequestBody $req
+                    Write-Host "    Testando conexao: $($data.ip):$($data.port)..."
+                    $tcp = New-Object Net.Sockets.TcpClient
+                    try {
+                        $task = $tcp.ConnectAsync($data.ip, $data.port)
+                        $connected = $task.Wait(3000)
+                        if ($connected -and $tcp.Connected) {
+                            Send-JsonResponse $res @{ success = $true; message = "Conectado com sucesso!" }
+                        } else {
+                            Send-JsonResponse $res @{ success = $false; message = "Timeout ao conectar no servidor." }
+                        }
+                    } catch {
+                        Send-JsonResponse $res @{ success = $false; message = "Falha ao conectar: $($_.Exception.InnerException.Message)" }
+                    } finally {
+                        $tcp.Close()
+                    }
+                }
+                elseif ($method -eq "POST" -and $path -eq "/api/install") {
+                    $data = Read-RequestBody $req
+                    Write-Host "    Instalacao iniciada: $($data.ip):$($data.port)"
+                    Invoke-WebInstall $res $data
+                    Write-Host "    Instalacao concluida"
+                }
+                elseif ($method -eq "POST" -and $path -eq "/api/monitor") {
+                    $batPath = Join-Path $scriptDir "install-bypass.bat"
+                    Start-Process cmd -ArgumentList "/k", "cd /d `"$scriptDir`" & `"$batPath`" monitor"
+                    Send-JsonResponse $res @{ success = $true }
+                }
+                elseif ($method -eq "POST" -and $path -eq "/api/cancel") {
+                    Write-Host "    Revertendo instalacao..."
+                    try {
+                        # Para sing-box e remove tarefa agendada
+                        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+                        if ($task) {
+                            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+                            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                        Get-Process sing-box -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                        Start-Sleep 1
+
+                        # Remove adaptador TUN
+                        $tun = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+                            $_.Name -eq "sing-box" -or $_.Name -eq "singbox-tun" -or $_.InterfaceDescription -like "*Wintun*"
+                        }
+                        foreach ($a in $tun) {
+                            try { Remove-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop } catch { }
+                        }
+
+                        # Limpa DNS
+                        & ipconfig.exe /flushdns | Out-Null
+                        Clear-DnsClientCache -ErrorAction SilentlyContinue
+
+                        Write-Host "    Reversao concluida"
+                        Send-JsonResponse $res @{ success = $true; message = "Proxy desinstalada com sucesso" }
+                    } catch {
+                        Write-Fail "Erro na reversao: $($_.Exception.Message)"
+                        Send-JsonResponse $res @{ success = $false; message = $_.Exception.Message } 500
+                    }
+                }
+                else {
+                    $res.StatusCode = 404
+                    $res.Close()
+                }
+            } catch {
+                try {
+                    $errMsg = $_.Exception.Message
+                    $errBytes = [Text.Encoding]::UTF8.GetBytes($errMsg)
+                    $res.StatusCode = 500
+                    $res.ContentType = "text/plain; charset=utf-8"
+                    $res.ContentLength64 = $errBytes.Length
+                    $res.OutputStream.Write($errBytes, 0, $errBytes.Length)
+                    $res.Close()
+                } catch { }
+            }
+        }
+    } finally {
+        try { $listener.Stop() } catch { }
+    }
+}
+
+if (-not $SkipAdminCheck) {
+    # ---------------------------------------------------------------- 0. admin
+    Write-Step "Verificando privilegios"
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+               ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Warn2 "Nao esta como administrador. Reabrindo com elevacao..."
+        $relaunchArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        foreach ($key in $PSBoundParameters.Keys) {
+            $val = $PSBoundParameters[$key]
+            if ($val -is [System.Management.Automation.SwitchParameter]) {
+                if ($val.IsPresent) { $relaunchArgs += " -$key" }
+            } elseif ($val -is [bool]) {
+                if ($val) { $relaunchArgs += " -$key" }
+            } else {
+                $relaunchArgs += " -$key `"$val`""
+            }
+        }
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $relaunchArgs
+        exit
+    }
+    Write-Ok "Rodando como administrador"
+}
+
+if ($WebUI) { Start-WebSetup; exit 0 }
 
 # Tudo abaixo roda dentro de try/finally: a janela so fecha depois de um ENTER,
 # inclusive quando acontece um erro (senao a janela elevada some antes de dar para ler).

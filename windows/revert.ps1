@@ -11,7 +11,6 @@
       4. Limpa cache de DNS
       5. Reinicia o Discord (se estiver aberto) para ele reconectar
          pela rede normal
-      6. Testa a conexao local (IP publico pela saida direta)
 
     Parametros:
       -RemoveFiles   apaga tambem C:\Program Files\sing-box
@@ -203,20 +202,7 @@ if ($discordRunning) {
     Write-Host "    Discord nao estava em execucao"
 }
 
-# ---------------------------------------------------------------- 7. teste
-Write-Step "TESTE - Conexao local da maquina"
-$tunLeft = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "sing-box" -or $_.Name -eq "singbox-tun" -or $_.InterfaceDescription -like "*Wintun*" }
-if ($tunLeft) { Write-Warn2 "Ainda existe adaptador TUN: $($tunLeft.Name -join ', ')" } else { Write-Ok "Sem adaptador TUN" }
 
-if (Get-Process sing-box -ErrorAction SilentlyContinue) { Write-Fail "sing-box ainda em execucao" } else { Write-Ok "sing-box nao esta rodando" }
-
-$ping = Test-NetConnection -ComputerName 1.1.1.1 -InformationLevel Quiet -WarningAction SilentlyContinue
-if ($ping) { Write-Ok "Ping para 1.1.1.1 respondeu" } else { Write-Fail "Ping para 1.1.1.1 falhou" }
-
-$ip = Get-PublicIp
-if ($ip) { Write-Ok "IP publico (rede normal): $ip" } else { Write-Fail "Nao consegui obter o IP publico - verifique a rede (tente -ResetWinsock e reinicie)" }
-
-Write-Host ""
 Write-Host "================ CONCLUIDO ================" -ForegroundColor Cyan
 Write-Host " Rede da maquina de volta ao normal."
 if ($ResetWinsock) { Write-Host " Reinicie o Windows para concluir o reset do Winsock." -ForegroundColor Yellow }

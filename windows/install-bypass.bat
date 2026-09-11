@@ -8,10 +8,13 @@ set "INSTALL=.\setup.ps1"
 set "CMD=%~1"
 if "%CMD%"=="" set "CMD=instalar"
 
+set "USECLI=0"
 set "ARGS="
 :loop
 shift
 if "%~1"=="" goto :run
+if /i "%~1"=="--cli"      (set "USECLI=1" & goto :loop)
+if /i "%~1"=="--terminal" (set "USECLI=1" & goto :loop)
 set "ARGS=%ARGS% %1"
 goto :loop
 
@@ -45,7 +48,11 @@ if %errorlevel%==0 (
         goto :eof
     )
 )
-%PS% "%INSTALL%" %ARGS%
+if "%USECLI%"=="1" (
+    %PS% "%INSTALL%" %ARGS%
+) else (
+    %PS% "%INSTALL%" -WebUI %ARGS%
+)
 goto :eof
 
 :monitor
@@ -60,18 +67,22 @@ goto :eof
 
 :ajuda
 echo.
-echo  Uso: singbox.bat [comando] [opcoes]
+echo  Uso: install-bypass.bat [comando] [opcoes]
 echo.
-echo    instalar   (padrao)  baixa, configura e inicia o sing-box; so precisa rodar uma vez
+echo    instalar   (padrao)  baixa, configura e inicia o sing-box (abre interface web)
 echo    monitor              trafego e status da rede ao vivo (Ctrl+C para sair)
 echo    logs                 log do sing-box continuo e legivel (Ctrl+C para sair)
 echo    ajuda                esta tela
 echo.
-echo  Exemplos:
-echo    singbox.bat
-echo    singbox.bat monitor
+echo  Opcoes:
+echo    --cli                usa o modo terminal em vez da interface web
 echo.
-echo  Para desfazer a instalacao use o script separado: reverter-singbox-discord.ps1
+echo  Exemplos:
+echo    install-bypass.bat
+echo    install-bypass.bat monitor
+echo    install-bypass.bat instalar --cli
+echo.
+echo  Para desfazer a instalacao use o script separado: revert.ps1
 echo.
 pause
 goto :eof

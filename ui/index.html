@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discord Proxy Setup</title>
+    <meta name="description" content="Configure a proxy para o Discord de forma simples e visual.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="bg-orb bg-orb-1"></div>
+    <div class="bg-orb bg-orb-2"></div>
+    <div class="bg-orb bg-orb-3"></div>
+
+    <main class="container">
+        <div class="card">
+            <div class="header">
+                <div class="header-icon">
+                    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                </div>
+                <h1 id="header-title">Discord Proxy</h1>
+                <p id="header-subtitle">Configure a proxy para o Discord</p>
+            </div>
+            <div id="card-content">
+                <div class="loading-container">
+                    <div class="loading-spinner"></div>
+                    <span style="color: var(--text-muted); font-size: 13px;">Verificando...</span>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div id="confirm-root"></div>
+
+    <script src="script.js"></script>
+</body>
+</html>

@@ -21,20 +21,22 @@ sing-box (Windows): "https://github.com/SagerNet/sing-box"
 
 ### O que você precisa
 
-- Os arquivos `setup.sh`, `teardown.sh` e `run-discord.sh` (nesta pasta).
-- A senha do servidor Shadowsocks (peça pra quem configurou a VPS).
+- A pasta `linux` inteira e a pasta `ui`.
+- O IP, a porta e a senha do servidor Shadowsocks (peça pra quem configurou a VPS).
 
 ### Primeira vez usando
 
-1. Abra o arquivo `setup.sh` num editor de texto.
-2. Ache a linha `SERVER_PASSWORD="..."` perto do topo e troque pela senha real.
-3. Salve o arquivo.
-4. Abra um terminal nesta pasta e rode:
+1. Abra um terminal na pasta `linux`.
+2. Dê permissão de execução ao script (se necessário) e inicie o painel de controle:
    ```bash
-   sudo ./setup.sh
+   chmod +x install-bypass.sh
+   ./install-bypass.sh
    ```
-5. Vai pedir sua senha do computador (não a do proxy). Espere terminar —
-   ele mesmo baixa tudo que precisa e testa a conexão no final.
+3. Ele vai pedir sua senha de usuário do computador (`sudo`), necessária para configurar o isolamento de rede.
+4. Uma interface gráfica abrirá no seu navegador.
+5. Digite o **IP**, a **porta** e a **senha** do servidor.
+6. Clique em **Testar Conexão** para garantir que o servidor está acessível.
+7. Clique em **Instalar** e aguarde a finalização. O script baixa o que precisar e configura tudo sozinho.
 
 ### Todo dia, pra usar o Discord
 
@@ -67,8 +69,7 @@ Isso desfaz tudo que o `setup.sh` criou e devolve a rede ao normal.
 
 ### O que você precisa
 
-- A pasta `windows` inteira (`install-bypass.bat`, `setup.ps1`, `revert.ps1`
-  e `config.json`). Os arquivos precisam ficar juntos.
+- A pasta `windows` inteira e a pasta `ui` (Os arquivos precisam ficar juntos na mesma estrutura).
 - O IP, a porta e a senha do servidor Shadowsocks (peça pra quem
   configurou a VPS).
 
@@ -80,12 +81,11 @@ Isso desfaz tudo que o `setup.sh` criou e devolve a rede ao normal.
    install-bypass.bat
    ```
 3. Se aparecer um aviso pedindo permissão de Administrador, aceite.
-4. O script vai perguntar o **IP**, a **porta** e a **senha** do servidor.
-   Digite e aperte ENTER (a senha não aparece na tela enquanto você digita).
-5. Ele mesmo baixa o sing-box, instala em `C:\Program Files\sing-box`,
-   registra pra iniciar junto com o Windows e testa a conexão no final.
-6. Se o Discord já estiver aberto, o script fecha e reabre ele sozinho.
-   Se não estiver, ele pede pra você abrir na hora do último teste.
+4. Uma interface gráfica abrirá no seu navegador.
+5. Digite o **IP**, a **porta** e a **senha** do servidor.
+6. Clique em **Testar Conexão** para garantir que o servidor está acessível.
+7. Clique em **Instalar** e aguarde a finalização. Ele baixa o sing-box, instala em `C:\Program Files\sing-box`, e registra pra iniciar junto com o Windows.
+8. Se o Discord já estiver aberto, o script fecha e reabre ele sozinho.
 
 ### Todo dia, pra usar o Discord
 
@@ -129,7 +129,7 @@ virtual e as rotas, e devolve a rede ao normal. Pra apagar também a pasta
 
 | | Linux | Windows |
 |---|---|---|
-| Primeira vez | `sudo ./setup.sh` | `install-bypass.bat` |
+| Primeira vez | `./linux/install-bypass.sh` | `windows\install-bypass.bat` |
 | Usar o Discord | `./run-discord.sh` | Abrir o Discord normalmente |
 | Ver se funciona | — | `install-bypass.bat monitor` |
 | Desfazer tudo | `sudo ./teardown.sh` | `revert.ps1` |
