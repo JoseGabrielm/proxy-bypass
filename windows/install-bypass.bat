@@ -60,7 +60,7 @@ goto :eof
 
 :ajuda
 echo.
-echo  Uso: singbox.bat [comando] [opcoes]
+echo  Uso: install-bypass.bat [comando] [opcoes]
 echo.
 echo    instalar   (padrao)  baixa, configura e inicia o sing-box; so precisa rodar uma vez
 echo    monitor              trafego e status da rede ao vivo (Ctrl+C para sair)
@@ -68,10 +68,10 @@ echo    logs                 log do sing-box continuo e legivel (Ctrl+C para sai
 echo    ajuda                esta tela
 echo.
 echo  Exemplos:
-echo    singbox.bat
-echo    singbox.bat monitor
+echo    install-bypass.bat
+echo    install-bypass.bat monitor
 echo.
-echo  Para desfazer a instalacao use o script separado: reverter-singbox-discord.ps1
+echo  Para desfazer a instalacao use: revert-bypass.bat
 echo.
 pause
 goto :eof
