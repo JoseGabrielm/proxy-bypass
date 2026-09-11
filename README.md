@@ -37,8 +37,9 @@ sing-box (Windows): "https://github.com/SagerNet/sing-box"
    seu navegador padrão pedindo IP, porta e senha do servidor — ela testa a
    conexão de verdade antes de aceitar (sem mexer na rede do PC ainda); se
    errar a senha, é só tentar de novo na mesma aba.
-3. Espere terminar — ele baixa o que precisa, sobe o túnel e testa a
-   conexão no final.
+3. Espere terminar — ele baixa o que precisa, sobe o túnel, testa a conexão
+   e no final habilita uma unit do systemd (`discord-proxy-setup`) que
+   recria tudo sozinho a cada boot, sem pedir nada de novo.
 
 ### Todo dia, pra usar o Discord
 
@@ -52,9 +53,15 @@ só na hora certa.
 
 ### Se o computador reiniciar
 
-O passo 1 (`sudo ./setup.sh`) precisa ser rodado de novo depois de cada
-reinicialização do PC (mas é rápido — ele reaproveita a senha já confirmada
-antes e não pede de novo; só recria o namespace/túnel, que somem no reboot).
+Nada a fazer — o setup roda sozinho no boot (unit `discord-proxy-setup`
+habilitada na primeira vez) e reaproveita a senha já confirmada antes; só
+recria o namespace/túnel, que somem no reboot. Se preferir controlar
+manualmente em vez de automático:
+```bash
+sudo ./setup.sh --no-persist
+```
+Isso desativa a unit de boot (ou evita habilitá-la, se ainda não existir) —
+aí é rodar `sudo ./setup.sh` você mesmo depois de cada reinicialização.
 
 ### Se precisar trocar IP/porta/senha da proxy
 
@@ -158,6 +165,7 @@ Dúvidas ou algo travou? Chama quem configurou o servidor.
 - `run-discord.sh` — abre o Discord dentro do namespace configurado.
 - `.state` — gerado automaticamente pelo `setup.sh`, usado pelo `teardown.sh` para saber exatamente o que reverter (ex: se o `ip_forward` já estava ligado antes por causa do Docker). Não edite manualmente.
 - `/etc/shadowsocks/client.json` — guarda IP/porta/senha confirmados; é onde o `setup.sh` verifica se já tem credenciais válidas antes de abrir a página de novo.
+- `/etc/systemd/system/discord-proxy-setup.service` — unit oneshot criada pelo `setup.sh` (a menos que rodado com `--no-persist`) que reexecuta o próprio `setup.sh` a cada boot, depois que a rede sobe (`network-online.target`). Como as credenciais já estão em `client.json`, essa execução automática nunca abre navegador nem pede nada — só recria namespace/veth/NAT/tun2socks. `teardown.sh` remove essa unit junto com o resto.
 
 ### O que é seguro e o que fica isolado
 
@@ -172,9 +180,11 @@ comando só, caso algo saia diferente do esperado.
 
 ## Limitações conhecidas
 
-- **Não sobrevive a reboot**: network namespaces são voláteis. Depois de
-  reiniciar o PC, rode `sudo ./setup.sh` de novo (ele detecta o que já existe
-  e pula essas partes; só recria o namespace/tun2socks, que somem no reboot).
+- **O namespace em si não sobrevive a reboot** (são voláteis por natureza),
+  mas por padrão isso é transparente: a unit `discord-proxy-setup` recria
+  tudo sozinha logo depois que a rede sobe no boot. Com `--no-persist`, essa
+  unit não é instalada e você volta a precisar rodar `sudo ./setup.sh`
+  manualmente depois de cada reinicialização.
 - **Se trocar de distro**: os binários (`sslocal`, `tun2socks`) são estáticos
   e continuam funcionando; só confirme que `curl`, `tar`, `unzip`,
   `iptables`/`iproute2` e `python3` estão instalados (praticamente

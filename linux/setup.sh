@@ -13,9 +13,13 @@
 # Uso:
 #   sudo ./setup.sh                # pede IP/porta/senha numa pagina local no
 #                                   # navegador (testa a conexao de verdade
-#                                   # antes de aceitar, sem tocar na rede)
+#                                   # antes de aceitar, sem tocar na rede) e
+#                                   # habilita reinicio automatico no boot
 #   sudo ./setup.sh --reconfigure  # forca pedir os dados de novo, mesmo se
 #                                   # ja houver credenciais confirmadas
+#   sudo ./setup.sh --no-persist   # nao instala/habilita a unit de boot
+#                                   # (voce roda ./setup.sh manualmente a
+#                                   # cada reinicializacao, como antes)
 #
 # Se preferir, ainda da pra pre-preencher SERVER_IP/SERVER_PORT/SERVER_PASSWORD
 # abaixo (a pagina abre com esses valores prontos, so falta confirmar).
@@ -23,7 +27,13 @@
 set -euo pipefail
 
 RECONFIGURE=0
-[[ "${1:-}" == "--reconfigure" ]] && RECONFIGURE=1
+NO_PERSIST=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --reconfigure) RECONFIGURE=1 ;;
+        --no-persist)  NO_PERSIST=1 ;;
+    esac
+done
 
 # ============================ CONFIGURACAO ============================
 SERVER_IP="SEU_IP_AQUI"
@@ -52,6 +62,7 @@ DOWNLOAD_DIR="${SCRIPT_DIR}/.downloads"
 BIN_DIR="/usr/local/bin"
 SS_CONFIG_DIR="/etc/shadowsocks"
 SS_SERVICE_NAME="shadowsocks-netns-client"
+BOOT_SERVICE_NAME="discord-proxy-setup"
 NETNS_DNS_DIR="/etc/netns/${NETNS_NAME}"
 
 step() { echo -e "\n\033[1;36m==> $*\033[0m"; }
@@ -485,6 +496,7 @@ VETH_NS_IP=${VETH_NS_IP}
 NETNS_NAME=${NETNS_NAME}
 VETH_HOST=${VETH_HOST}
 SS_SERVICE_NAME=${SS_SERVICE_NAME}
+BOOT_SERVICE_NAME=${BOOT_SERVICE_NAME}
 SS_CONFIG_DIR=${SS_CONFIG_DIR}
 NETNS_DNS_DIR=${NETNS_DNS_DIR}
 SETUP_DATE=$(date -Iseconds)
@@ -635,6 +647,47 @@ if curl -s --max-time 5 https://ifconfig.me >/dev/null; then
     ok "Rede do host (fora do namespace) segue normal."
 else
     warn "Nao consegui confirmar a rede do host — verifique manualmente. Se algo quebrou, rode: sudo ./teardown.sh"
+fi
+
+# ------------------------------------------------------------------------
+if [[ $NO_PERSIST -eq 0 ]]; then
+    step "Habilitando execucao automatica no boot"
+
+    # ExecStart aponta pro caminho real deste script (SCRIPT_DIR), entao
+    # funciona onde quer que o repositorio esteja clonado. Como o script e'
+    # idempotente e ja tem as credenciais confirmadas em client.json a essa
+    # altura, rodar de novo no boot NAO abre navegador nem pede nada -
+    # so recria namespace/veth/NAT/tun2socks, que somem no reboot.
+    cat > "/etc/systemd/system/${BOOT_SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Recria o namespace/tunel do Discord (proxy-bypass) no boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${SCRIPT_DIR}/setup.sh
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "$BOOT_SERVICE_NAME" >/dev/null
+    ok "Unit '${BOOT_SERVICE_NAME}' habilitada - o setup roda sozinho a cada boot, sem pedir nada de novo"
+    ok "Pra desativar: sudo systemctl disable ${BOOT_SERVICE_NAME}  (ou rode ./setup.sh --no-persist da proxima vez)"
+else
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${BOOT_SERVICE_NAME}.service"; then
+        systemctl disable "$BOOT_SERVICE_NAME" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${BOOT_SERVICE_NAME}.service"
+        systemctl daemon-reload
+        ok "Execucao automatica no boot desativada (--no-persist). Rode 'sudo ./setup.sh' manualmente apos cada reinicializacao."
+    else
+        ok "Execucao automatica no boot NAO habilitada (--no-persist). Rode 'sudo ./setup.sh' manualmente apos cada reinicializacao."
+    fi
 fi
 
 echo -e "\nSetup concluido. Use ./run-discord.sh para abrir o Discord dentro do proxy."
