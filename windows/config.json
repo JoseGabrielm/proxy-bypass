@@ -37,7 +37,9 @@
     "rules": [
       {
         "inbound": "tun-in",
-        "action": "sniff"
+        "action": "sniff",
+        "timeout": "150ms"
+        
       },
       {
         "inbound": "proxy-in",
