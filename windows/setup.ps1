@@ -380,8 +380,16 @@ function Start-TrafficMonitor {
         # --- status do processo / tarefa
         $proc = Get-Process sing-box -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($proc) {
-            $up = $now - $proc.StartTime
-            [void]$sb.AppendLine(("  sing-box   : RODANDO  PID {0}  ha {1:d\.hh\:mm\:ss}  RAM {2}" -f $proc.Id, $up, (Format-Bytes $proc.WorkingSet64)))
+            # StartTime nao e legivel sem elevacao quando o sing-box roda como SYSTEM
+            # (tarefa agendada) - vira $null e "$now - $null" estoura. Mostra "?" nesse caso.
+            $upStr = "?"
+            try {
+                $st = $proc.StartTime
+                if ($st) { $upStr = "{0:d\.hh\:mm\:ss}" -f ($now - $st) }
+            } catch { }
+            $ramStr = "?"
+            try { $ramStr = Format-Bytes $proc.WorkingSet64 } catch { }
+            [void]$sb.AppendLine(("  sing-box   : RODANDO  PID {0}  ha {1}  RAM {2}" -f $proc.Id, $upStr, $ramStr))
         } else {
             [void]$sb.AppendLine("  sing-box   : PARADO")
         }
