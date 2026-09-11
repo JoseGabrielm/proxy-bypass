@@ -32,6 +32,7 @@ NETNS_NAME="discord-ns"
 VETH_HOST="veth-host"
 VETH_NS_IP="10.200.200.2"
 SS_SERVICE_NAME="shadowsocks-netns-client"
+BOOT_SERVICE_NAME="discord-proxy-setup"
 SS_CONFIG_DIR="/etc/shadowsocks"
 NETNS_DNS_DIR="/etc/netns/discord-ns"
 IFACE_OUT=""
@@ -118,6 +119,23 @@ if systemctl list-unit-files 2>/dev/null | grep -q "^${SS_SERVICE_NAME}.service"
     ok "Servico ${SS_SERVICE_NAME} removido."
 else
     ok "Servico ${SS_SERVICE_NAME} ja nao existia."
+fi
+
+# ------------------------------------------------------------------------
+step "Removendo a unit de execucao automatica no boot (se existir)"
+
+# Importante remover mesmo aqui: como o passo seguinte apaga o client.json
+# (as credenciais confirmadas), deixar a unit de boot ativa faria o proximo
+# boot tentar rodar o setup sem credenciais salvas - e como e' um servico
+# systemd sem terminal/tela, ficaria preso tentando abrir a pagina web sem
+# ninguem pra responder.
+if systemctl list-unit-files 2>/dev/null | grep -q "^${BOOT_SERVICE_NAME}.service"; then
+    systemctl disable --now "$BOOT_SERVICE_NAME" 2>/dev/null
+    rm -f "/etc/systemd/system/${BOOT_SERVICE_NAME}.service"
+    systemctl daemon-reload
+    ok "Unit ${BOOT_SERVICE_NAME} removida."
+else
+    ok "Unit ${BOOT_SERVICE_NAME} ja nao existia."
 fi
 
 # ------------------------------------------------------------------------

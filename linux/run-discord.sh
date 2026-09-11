@@ -4,6 +4,11 @@
 # pelo setup.sh. Todo o trafego do Discord (texto, API, voz, video, screen
 # share) sai pela VPS; o resto do sistema fica de fora.
 #
+# Se o Discord ja estiver aberto fora do namespace, o Electron detecta a
+# instancia existente, repassa o controle pra ela e sai ("Quitting secondary
+# instance") - nesse caso nada passa pela proxy. Por isso este script mata
+# qualquer instancia ja rodando antes de abrir a isolada.
+#
 # Uso: ./run-discord.sh   (nao precisa rodar como root, ele mesmo pede sudo
 #                          so para o comando 'ip netns exec')
 #
@@ -39,6 +44,25 @@ if [[ $EUID -eq 0 ]]; then
 else
     REAL_USER="$(id -un)"
     REAL_HOME="$HOME"
+fi
+
+# Mata qualquer instancia do Discord ja rodando fora do namespace (ver nota
+# no topo do arquivo sobre o lock de instancia unica do Electron).
+EXISTING_PIDS="$(pgrep -u "$REAL_USER" -i discord || true)"
+if [[ -n "$EXISTING_PIDS" ]]; then
+    echo "Encontrei o Discord ja rodando fora do namespace - encerrando antes de abrir a versao isolada..."
+    # shellcheck disable=SC2086
+    kill $EXISTING_PIDS 2>/dev/null || true
+    for _ in $(seq 1 10); do
+        pgrep -u "$REAL_USER" -i discord >/dev/null 2>&1 || break
+        sleep 1
+    done
+    if pgrep -u "$REAL_USER" -i discord >/dev/null 2>&1; then
+        echo "Ainda tinha processo(s) de pe, forcando encerramento..."
+        # shellcheck disable=SC2086
+        kill -9 $(pgrep -u "$REAL_USER" -i discord) 2>/dev/null || true
+        sleep 1
+    fi
 fi
 
 echo "Abrindo Discord dentro do namespace ${NETNS_NAME} (${DISCORD_BIN}) como usuario '${REAL_USER}'..."
