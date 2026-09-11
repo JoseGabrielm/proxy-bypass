@@ -22,19 +22,23 @@ sing-box (Windows): "https://github.com/SagerNet/sing-box"
 ### O que você precisa
 
 - Os arquivos `setup.sh`, `teardown.sh` e `run-discord.sh` (nesta pasta).
-- A senha do servidor Shadowsocks (peça pra quem configurou a VPS).
+- `python3` instalado (usado só para abrir a página local que pede os dados
+  da proxy — praticamente toda distro desktop já vem com ele).
+- O IP, a porta e a senha do servidor Shadowsocks (peça pra quem configurou
+  a VPS).
 
 ### Primeira vez usando
 
-1. Abra o arquivo `setup.sh` num editor de texto.
-2. Ache a linha `SERVER_PASSWORD="..."` perto do topo e troque pela senha real.
-3. Salve o arquivo.
-4. Abra um terminal nesta pasta e rode:
+1. Abra um terminal nesta pasta e rode:
    ```bash
    sudo ./setup.sh
    ```
-5. Vai pedir sua senha do computador (não a do proxy). Espere terminar —
-   ele mesmo baixa tudo que precisa e testa a conexão no final.
+2. Vai pedir sua senha do computador (não a do proxy). Uma página abre no
+   seu navegador padrão pedindo IP, porta e senha do servidor — ela testa a
+   conexão de verdade antes de aceitar (sem mexer na rede do PC ainda); se
+   errar a senha, é só tentar de novo na mesma aba.
+3. Espere terminar — ele baixa o que precisa, sobe o túnel e testa a
+   conexão no final.
 
 ### Todo dia, pra usar o Discord
 
@@ -48,9 +52,16 @@ só na hora certa.
 
 ### Se o computador reiniciar
 
-O passo 4 (`sudo ./setup.sh`) precisa ser rodado de novo depois de cada
-reinicialização do PC (mas é rápido — a segunda vez em diante ele pula as
-partes que já estão prontas).
+O passo 1 (`sudo ./setup.sh`) precisa ser rodado de novo depois de cada
+reinicialização do PC (mas é rápido — ele reaproveita a senha já confirmada
+antes e não pede de novo; só recria o namespace/túnel, que somem no reboot).
+
+### Se precisar trocar IP/porta/senha da proxy
+
+```bash
+sudo ./setup.sh --reconfigure
+```
+Força abrir a página de novo mesmo já tendo credenciais confirmadas.
 
 ### Se algo der errado / quiser desfazer tudo
 
@@ -142,10 +153,11 @@ Dúvidas ou algo travou? Chama quem configurou o servidor.
 
 ### Arquivos
 
-- `setup.sh` — cria tudo (namespace, veth, NAT, serviço Shadowsocks, tun2socks). Idempotente.
+- `setup.sh` — cria tudo (namespace, veth, NAT, serviço Shadowsocks, tun2socks). Idempotente. Na primeira vez (ou com `--reconfigure`), abre uma página local no navegador (servida via `python3`, só em `127.0.0.1`) pra pedir IP/porta/senha da proxy; ela testa a conexão de verdade contra o servidor (uma instância isolada do `sslocal`, sem tocar em namespace/rede) antes de aceitar os dados, e permite tentar de novo na mesma aba se a senha estiver errada — evita configurar o túnel real com uma credencial que não funciona.
 - `teardown.sh` — reverte **tudo** que o `setup.sh` criou. Use se algo parecer errado com a rede.
 - `run-discord.sh` — abre o Discord dentro do namespace configurado.
 - `.state` — gerado automaticamente pelo `setup.sh`, usado pelo `teardown.sh` para saber exatamente o que reverter (ex: se o `ip_forward` já estava ligado antes por causa do Docker). Não edite manualmente.
+- `/etc/shadowsocks/client.json` — guarda IP/porta/senha confirmados; é onde o `setup.sh` verifica se já tem credenciais válidas antes de abrir a página de novo.
 
 ### O que é seguro e o que fica isolado
 
@@ -164,8 +176,16 @@ comando só, caso algo saia diferente do esperado.
   reiniciar o PC, rode `sudo ./setup.sh` de novo (ele detecta o que já existe
   e pula essas partes; só recria o namespace/tun2socks, que somem no reboot).
 - **Se trocar de distro**: os binários (`sslocal`, `tun2socks`) são estáticos
-  e continuam funcionando; só confirme que `curl`, `tar`, `unzip` e
-  `iptables`/`iproute2` estão instalados (praticamente universais).
+  e continuam funcionando; só confirme que `curl`, `tar`, `unzip`,
+  `iptables`/`iproute2` e `python3` estão instalados (praticamente
+  universais em distros desktop; `python3` só é usado pela página local de
+  credenciais).
+- **systemd é obrigatório** (o serviço do `sslocal` é registrado via
+  `systemctl`) — distros sem systemd (Alpine, Void, Devuan, Gentoo com
+  OpenRC) não funcionam sem adaptar essa parte.
+- **Só x86_64 por enquanto**: os downloads de `sslocal`/`tun2socks` são
+  fixos pra `amd64`; ARM64 (Raspberry Pi, Asahi Linux) precisa editar as
+  URLs de download no topo do `setup.sh`.
 - Se o caminho do executável do Discord for diferente do detectado por
   `which discord`, edite `DISCORD_BIN` em `run-discord.sh`.
 

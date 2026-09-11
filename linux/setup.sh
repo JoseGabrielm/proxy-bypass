@@ -11,10 +11,19 @@
 # a qualquer momento para desfazer tudo caso algo pareca errado.
 #
 # Uso:
-#   1. Edite SERVER_IP e SERVER_PASSWORD abaixo.
-#   2. sudo ./setup.sh
+#   sudo ./setup.sh                # pede IP/porta/senha numa pagina local no
+#                                   # navegador (testa a conexao de verdade
+#                                   # antes de aceitar, sem tocar na rede)
+#   sudo ./setup.sh --reconfigure  # forca pedir os dados de novo, mesmo se
+#                                   # ja houver credenciais confirmadas
+#
+# Se preferir, ainda da pra pre-preencher SERVER_IP/SERVER_PORT/SERVER_PASSWORD
+# abaixo (a pagina abre com esses valores prontos, so falta confirmar).
 #
 set -euo pipefail
+
+RECONFIGURE=0
+[[ "${1:-}" == "--reconfigure" ]] && RECONFIGURE=1
 
 # ============================ CONFIGURACAO ============================
 SERVER_IP="SEU_IP_AQUI"
@@ -54,14 +63,6 @@ die()  { echo -e "    \033[1;31m[ERRO]\033[0m $*"; exit 1; }
 if [[ $EUID -ne 0 ]]; then
     echo "Este script precisa de root (cria namespaces, interfaces e regras de firewall)."
     exec sudo -E "$0" "$@"
-fi
-
-if [[ "$SERVER_IP" == "SEU_IP_AQUI" ]]; then
-    die "Edite a variavel SERVER_IP no topo do script antes de rodar."
-fi
-
-if [[ "$SERVER_PASSWORD" == "SUA_SENHA_AQUI" ]]; then
-    die "Edite a variavel SERVER_PASSWORD no topo do script antes de rodar."
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}"
@@ -130,6 +131,346 @@ fi
 ok "Checkpoint: ambos os binarios confirmados em ${BIN_DIR}."
 
 # ------------------------------------------------------------------------
+step "Configurando credenciais do Shadowsocks"
+
+command -v python3 >/dev/null 2>&1 \
+    || die "python3 nao encontrado - necessario para configurar as credenciais do Shadowsocks. Instale com o gerenciador de pacotes da sua distro (ex: apt install python3 / dnf install python3 / pacman -S python)."
+
+CLIENT_JSON="${SS_CONFIG_DIR}/client.json"
+EXISTING_IP=""
+EXISTING_PORT=""
+EXISTING_PASSWORD=""
+
+if [[ -f "$CLIENT_JSON" ]]; then
+    # Le via json.load (em vez de sed) para nao truncar senhas com aspas
+    # escapadas, e escreve com shlex.quote para o 'source' ser seguro mesmo
+    # com $()/crases/aspas na senha.
+    EXISTING_SH="$(mktemp)"
+    python3 -c '
+import json, shlex, sys
+cfg_path, out_path = sys.argv[1], sys.argv[2]
+try:
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    ip, port, pw = str(cfg.get("server", "")), str(cfg.get("server_port", "")), str(cfg.get("password", ""))
+except Exception:
+    ip = port = pw = ""
+with open(out_path, "w") as f:
+    f.write("EXISTING_IP=%s\n" % shlex.quote(ip))
+    f.write("EXISTING_PORT=%s\n" % shlex.quote(port))
+    f.write("EXISTING_PASSWORD=%s\n" % shlex.quote(pw))
+' "$CLIENT_JSON" "$EXISTING_SH" || true
+    # shellcheck disable=SC1090
+    source "$EXISTING_SH"
+    rm -f "$EXISTING_SH"
+fi
+
+if [[ -n "$EXISTING_IP" && -n "$EXISTING_PASSWORD" && "$RECONFIGURE" -eq 0 ]]; then
+    SERVER_IP="$EXISTING_IP"
+    SERVER_PORT="${EXISTING_PORT:-$SERVER_PORT}"
+    SERVER_PASSWORD="$EXISTING_PASSWORD"
+    ok "Reaproveitando credenciais ja confirmadas em ${CLIENT_JSON} (use --reconfigure para trocar)"
+else
+    CURRENT_IP_FOR_FORM="$EXISTING_IP"
+    [[ -z "$CURRENT_IP_FOR_FORM" && "$SERVER_IP" != "SEU_IP_AQUI" ]] && CURRENT_IP_FOR_FORM="$SERVER_IP"
+
+    CURRENT_PORT_FOR_FORM="${EXISTING_PORT:-$SERVER_PORT}"
+
+    CURRENT_PASSWORD_FOR_FORM="$EXISTING_PASSWORD"
+    [[ -z "$CURRENT_PASSWORD_FOR_FORM" && "$SERVER_PASSWORD" != "SUA_SENHA_AQUI" ]] && CURRENT_PASSWORD_FOR_FORM="$SERVER_PASSWORD"
+
+    CRED_PY="$(mktemp)"
+    CRED_OUT="$(mktemp)"
+    trap 'rm -f "$CRED_PY" "$CRED_OUT"' EXIT
+
+    cat > "$CRED_PY" <<'PYEOF'
+#!/usr/bin/env python3
+import argparse, json, os, re, shlex, socket, subprocess, sys, tempfile, threading, time, webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--current-ip", default="")
+ap.add_argument("--current-port", default="")
+ap.add_argument("--method", required=True)
+ap.add_argument("--sslocal-bin", required=True)
+ap.add_argument("--out-file", required=True)
+args = ap.parse_args()
+
+CURRENT_PASSWORD = os.environ.get("SS_CRED_CURRENT_PASSWORD", "")
+HAS_CURRENT_PASSWORD = bool(CURRENT_PASSWORD)
+
+
+def find_free_port(start, end, host="127.0.0.1"):
+    for p in range(start, end + 1):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, p))
+            s.close()
+            return p
+        except OSError:
+            continue
+    return None
+
+
+def test_connection(server, port, method, password):
+    test_port = find_free_port(18080, 18090)
+    if not test_port:
+        return False
+
+    cfg = {
+        "server": server,
+        "server_port": port,
+        "password": password,
+        "method": method,
+        "local_address": "127.0.0.1",
+        "local_port": test_port,
+        "mode": "tcp_and_udp",
+    }
+    cfg_path = tempfile.mktemp(prefix="sslocal-test-")
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f)
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [args.sslocal_bin, "-c", cfg_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.0)
+        if proc.poll() is not None:
+            return False
+
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "--max-time", "6", "--proxy",
+                 "socks5h://127.0.0.1:%d" % test_port, "https://api.ipify.org"],
+                capture_output=True, text=True, timeout=8,
+            )
+        except Exception:
+            return False
+
+        ip = (r.stdout or "").strip()
+        return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip))
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if os.path.exists(cfg_path):
+            os.remove(cfg_path)
+
+
+PASS_NOTE = " (deixe em branco para manter a atual)" if HAS_CURRENT_PASSWORD else ""
+HAS_PASS_JS = "true" if HAS_CURRENT_PASSWORD else "false"
+
+PAGE = """<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<title>Dados da proxy Shadowsocks</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 420px; margin: 60px auto; padding: 0 16px; background:#111; color:#eee; }
+  label { display:block; margin-top: 16px; font-size: 14px; }
+  input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; background:#222; color:#eee; border:1px solid #444; border-radius:4px; font-size:14px; }
+  button { margin-top: 24px; padding: 10px 20px; width: 100%; background:#4c8bf5; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:15px; }
+  button:hover { background:#3a76e0; }
+  .err { color:#ff6b6b; font-size: 13px; margin-top: 4px; min-height: 16px; }
+  h2 { text-align:center; }
+</style>
+</head>
+<body>
+<h2>Dados da proxy Shadowsocks</h2>
+<form id="f" novalidate>
+  <label>IP/host do servidor
+    <input id="ip" name="ip" value="__CURRENT_IP__" autocomplete="off">
+  </label>
+  <div class="err" id="errIp"></div>
+
+  <label>Porta
+    <input id="port" name="port" value="__CURRENT_PORT__" autocomplete="off">
+  </label>
+  <div class="err" id="errPort"></div>
+
+  <label>Senha__PASS_NOTE__
+    <input id="pass" name="pass" type="text" autocomplete="off">
+  </label>
+  <div class="err" id="errPass"></div>
+
+  <div class="err" id="errGeneral" style="margin-top:12px"></div>
+  <button type="submit" id="btn">Salvar e continuar</button>
+</form>
+<script>
+var hasCurrentPass = __HAS_PASS_JS__;
+var form = document.getElementById('f');
+var btn = document.getElementById('btn');
+
+form.addEventListener('submit', function (e) {
+  e.preventDefault();
+  var ip = document.getElementById('ip').value.trim();
+  var port = document.getElementById('port').value.trim();
+  var pass = document.getElementById('pass').value.replace(/\\s+/g, '');
+  var ok = true;
+  document.getElementById('errIp').textContent = '';
+  document.getElementById('errPort').textContent = '';
+  document.getElementById('errPass').textContent = '';
+  document.getElementById('errGeneral').textContent = '';
+
+  if (!ip) { document.getElementById('errIp').textContent = 'Informe o IP ou host.'; ok = false; }
+
+  var portNum = Number(port);
+  if (!port || !Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+    document.getElementById('errPort').textContent = 'Porta invalida (1-65535).';
+    ok = false;
+  }
+
+  if (!pass && !hasCurrentPass) {
+    document.getElementById('errPass').textContent = 'Informe a senha.';
+    ok = false;
+  }
+
+  if (!ok) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Testando conexao com o servidor...';
+
+  fetch('/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'ip=' + encodeURIComponent(ip) + '&port=' + encodeURIComponent(port) + '&pass=' + encodeURIComponent(pass)
+  }).then(function (r) {
+    return r.text().then(function (text) { return { ok: r.ok, text: text }; });
+  }).then(function (res) {
+    if (res.ok) {
+      document.body.innerHTML = '<h2>Conectado! Pode fechar esta aba e voltar ao terminal.</h2>';
+      return;
+    }
+    btn.disabled = false;
+    btn.textContent = 'Salvar e continuar';
+    if (res.text === 'AUTH_FAILED') {
+      document.getElementById('errGeneral').textContent = 'Nao consegui conectar nesse servidor com esses dados. Confira IP, porta e senha, e tente de novo.';
+    } else {
+      document.getElementById('errGeneral').textContent = 'Dados invalidos, confira os campos.';
+    }
+  }).catch(function () {
+    btn.disabled = false;
+    btn.textContent = 'Salvar e continuar';
+    document.getElementById('errGeneral').textContent = 'Erro ao enviar. Tente novamente.';
+  });
+});
+</script>
+</body>
+</html>
+"""
+
+PAGE = (PAGE
+        .replace("__CURRENT_IP__", args.current_ip)
+        .replace("__CURRENT_PORT__", str(args.current_port))
+        .replace("__PASS_NOTE__", PASS_NOTE)
+        .replace("__HAS_PASS_JS__", HAS_PASS_JS))
+PAGE_BYTES = PAGE.encode("utf-8")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(PAGE_BYTES)))
+            self.end_headers()
+            self.wfile.write(PAGE_BYTES)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path != "/submit":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length).decode("utf-8")
+        data = parse_qs(raw)
+        ip = data.get("ip", [""])[0].strip()
+        port_str = data.get("port", [""])[0].strip()
+        pw = re.sub(r"\s+", "", data.get("pass", [""])[0])
+
+        port = None
+        try:
+            port = int(port_str)
+        except ValueError:
+            pass
+
+        format_valid = bool(ip) and port is not None and 1 <= port <= 65535 and (pw or HAS_CURRENT_PASSWORD)
+
+        status = "INVALID"
+        if format_valid:
+            test_pw = pw if pw else CURRENT_PASSWORD
+            print("    Testando conexao com %s:%d (isolado, sem tocar na rede)..." % (ip, port))
+            if test_connection(ip, port, args.method, test_pw):
+                status = "OK"
+                print("    [OK] Conexao com %s:%d confirmada" % (ip, port))
+            else:
+                status = "AUTH_FAILED"
+                print("    [AVISO] Nao consegui conectar em %s:%d com os dados informados - pedindo de novo na pagina" % (ip, port))
+
+        body = status.encode("utf-8")
+        self.send_response(200 if status == "OK" else 400)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+        if status == "OK":
+            with open(args.out_file, "w") as f:
+                f.write("NEW_SERVER_IP=%s\n" % shlex.quote(ip))
+                f.write("NEW_SERVER_PORT=%d\n" % port)
+                f.write("NEW_SERVER_PASSWORD=%s\n" % shlex.quote(pw if pw else CURRENT_PASSWORD))
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+
+listen_port = find_free_port(8765, 8774)
+if listen_port is None:
+    print("Nao consegui abrir um servidor local (portas 8765-8774 ocupadas)", file=sys.stderr)
+    sys.exit(1)
+
+httpd = HTTPServer(("127.0.0.1", listen_port), Handler)
+url = "http://127.0.0.1:%d/" % listen_port
+print("    Pagina: %s  (abrindo no navegador padrao...)" % url)
+try:
+    webbrowser.open(url)
+except Exception:
+    print("    Nao consegui abrir o navegador automaticamente. Acesse: %s" % url)
+
+httpd.serve_forever()
+PYEOF
+
+    SS_CRED_CURRENT_PASSWORD="$CURRENT_PASSWORD_FOR_FORM" python3 "$CRED_PY" \
+        --current-ip "$CURRENT_IP_FOR_FORM" \
+        --current-port "$CURRENT_PORT_FOR_FORM" \
+        --method "$METHOD" \
+        --sslocal-bin "${BIN_DIR}/sslocal" \
+        --out-file "$CRED_OUT" \
+        || die "Falha ao rodar a pagina de credenciais (python3 ${CRED_PY})"
+
+    # shellcheck disable=SC1090
+    source "$CRED_OUT"
+    rm -f "$CRED_PY" "$CRED_OUT"
+
+    [[ -n "${NEW_SERVER_IP:-}" ]] || die "Nao recebi os dados da pagina de credenciais."
+    SERVER_IP="$NEW_SERVER_IP"
+    SERVER_PORT="$NEW_SERVER_PORT"
+    SERVER_PASSWORD="$NEW_SERVER_PASSWORD"
+    ok "Dados recebidos e conexao com o servidor confirmada"
+fi
+
+# ------------------------------------------------------------------------
 step "Registrando estado atual do sistema (para o teardown reverter com precisao)"
 
 IP_FORWARD_WAS_ENABLED="$(sysctl -n net.ipv4.ip_forward)"
@@ -186,17 +527,27 @@ fi
 step "Configurando e subindo o cliente Shadowsocks (sslocal), escutando so para o namespace"
 
 mkdir -p "$SS_CONFIG_DIR"
-cat > "${SS_CONFIG_DIR}/client.json" <<EOF
-{
-  "server": "${SERVER_IP}",
-  "server_port": ${SERVER_PORT},
-  "password": "${SERVER_PASSWORD}",
-  "method": "${METHOD}",
-  "local_address": "${VETH_HOST_IP}",
-  "local_port": ${SOCKS_PORT},
-  "mode": "tcp_and_udp"
+# Gerado via python (json.dump) em vez de heredoc bash: a senha vem de um
+# formulario web agora (texto livre), e um heredoc <<EOF sem aspas faz
+# expansao de $(...) / crases no conteudo - risco de injecao de comando
+# como root, alem de poder gerar JSON invalido se a senha tiver aspas.
+SS_JSON_SERVER="$SERVER_IP" SS_JSON_PORT="$SERVER_PORT" SS_JSON_PASSWORD="$SERVER_PASSWORD" \
+SS_JSON_METHOD="$METHOD" SS_JSON_LOCAL_ADDR="$VETH_HOST_IP" SS_JSON_LOCAL_PORT="$SOCKS_PORT" \
+SS_JSON_OUT="${SS_CONFIG_DIR}/client.json" python3 -c '
+import json, os
+cfg = {
+    "server": os.environ["SS_JSON_SERVER"],
+    "server_port": int(os.environ["SS_JSON_PORT"]),
+    "password": os.environ["SS_JSON_PASSWORD"],
+    "method": os.environ["SS_JSON_METHOD"],
+    "local_address": os.environ["SS_JSON_LOCAL_ADDR"],
+    "local_port": int(os.environ["SS_JSON_LOCAL_PORT"]),
+    "mode": "tcp_and_udp",
 }
-EOF
+with open(os.environ["SS_JSON_OUT"], "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+' || die "Falha ao gerar ${SS_CONFIG_DIR}/client.json"
 
 cat > "/etc/systemd/system/${SS_SERVICE_NAME}.service" <<EOF
 [Unit]
