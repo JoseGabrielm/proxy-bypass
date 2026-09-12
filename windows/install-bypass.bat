@@ -80,9 +80,8 @@ echo.
 echo  Exemplos:
 echo    install-bypass.bat
 echo    install-bypass.bat monitor
-echo    install-bypass.bat instalar --cli
 echo.
-echo  Para desfazer a instalacao use o script separado: revert.ps1
+echo  Para desfazer a instalacao use: revert-bypass.bat
 echo.
 pause
 goto :eof

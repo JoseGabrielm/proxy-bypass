@@ -104,8 +104,9 @@ devolve a rede ao normal.
 
 ### O que você precisa
 
-- A pasta `windows` inteira (`install-bypass.bat`, `setup.ps1`, `revert.ps1`
-  e `config.json`). Os arquivos precisam ficar juntos.
+- A pasta `windows` inteira (`install-bypass.bat`, `revert-bypass.bat`,
+  `setup.ps1`, `revert.ps1` e `config.json`). Os arquivos precisam ficar
+  juntos.
 - Windows 10 1803 ou mais novo (o script usa o `curl.exe` que já vem com o
   sistema).
 - O IP, a porta e a senha do servidor Shadowsocks (peça pra quem
@@ -172,16 +173,20 @@ começo, mas mantém a instalada até você rodar com `-ForceReinstall`.
 
 ### Se algo der errado / quiser desfazer tudo
 
-Clique com o **botão direito** em `revert.ps1` e escolha **"Executar com o
-PowerShell"**, ou num terminal na pasta `windows`:
-```powershell
-powershell -ExecutionPolicy Bypass -File .\revert.ps1
+Num terminal na pasta `windows` (ou dando dois cliques no arquivo):
+```bat
+revert-bypass.bat
 ```
-Isso para o sing-box, remove a tarefa de inicialização, o adaptador de rede
-virtual e as rotas, reinicia o Discord pela rede normal e testa se a
-internet voltou. Pra apagar também a pasta `C:\Program Files\sing-box`
-(que guarda a senha no `config.json`), acrescente `-RemoveFiles` ao final
-do comando.
+Ele pede confirmação e depois para o sing-box, remove a tarefa de
+inicialização, o adaptador de rede virtual e as rotas, reinicia o Discord
+pela rede normal e testa se a internet voltou. Pra apagar também a pasta
+`C:\Program Files\sing-box` (que guarda a senha no `config.json`):
+```bat
+revert-bypass.bat completo
+```
+O `.bat` já roda o PowerShell com `-ExecutionPolicy Bypass`, então não
+precisa mexer na política de execução do Windows. Se preferir chamar o
+`revert.ps1` direto, use `powershell -ExecutionPolicy Bypass -File .\revert.ps1`.
 
 ---
 
@@ -194,7 +199,7 @@ do comando.
 | Depois de reiniciar o PC | Nada (automático) | Nada (automático) |
 | Trocar dados da proxy | `sudo ./setup.sh --reconfigure` | `install-bypass.bat` e responder `S` |
 | Ver se funciona | — | `install-bypass.bat monitor` |
-| Desfazer tudo | `sudo ./teardown.sh` | `revert.ps1` |
+| Desfazer tudo | `sudo ./teardown.sh` | `revert-bypass.bat` |
 
 Dúvidas ou algo travou? Chama quem configurou o servidor.
 
@@ -257,6 +262,7 @@ comando só, caso algo saia diferente do esperado.
   3. Grava IP/porta/senha no `config.json`, adiciona a Clash API em `127.0.0.1:9090` (usada pelos testes e pelo `monitor`) e log em arquivo (`sing-box.log`).
   4. Copia pra `C:\Program Files\sing-box`, valida com `sing-box check`, registra uma tarefa agendada (`sing-box`, roda como SYSTEM no boot, reinicia sozinha se cair) e inicia.
   5. Reinicia o Discord se estiver aberto (conexões antigas foram feitas antes da TUN existir) e roda três testes: saída direta, saída pela proxy (via socks local) e Discord passando pela TUN.
+- `revert-bypass.bat` — ponto de entrada pra desfazer. Sem argumentos roda o `revert.ps1`; `completo` acrescenta `-RemoveFiles`; `winsock` acrescenta `-ResetWinsock`; `ajuda` lista os comandos. Pede confirmação antes de rodar e avisa se a tarefa agendada `sing-box` não existir. Qualquer argumento extra é repassado ao `revert.ps1`. Existe pelo mesmo motivo do `install-bypass.bat`: chamar o PowerShell com `-ExecutionPolicy Bypass` pra não esbarrar na política de execução da máquina.
 - `revert.ps1` — desfaz tudo: para e remove a tarefa, mata o processo, remove o adaptador TUN (Wintun) e rotas órfãs, limpa DNS, reinicia o Discord pela rede normal e testa a saída direta. `-RemoveFiles` apaga também a pasta de instalação e as temporárias; `-ResetWinsock` reseta a pilha de rede (só se a rede continuar estranha, exige reboot).
 - `config.json` — config do sing-box com placeholders `__SERVER_IP__` e `__SERVER_PASSWORD__`, preenchidos pelo `setup.ps1`. Uma interface TUN (`singbox-tun`, `172.19.0.1/30`, `auto_route` + `strict_route`) captura todo o tráfego, mas só os processos `Discord.exe`, `DiscordCanary.exe` e `DiscordDevelopment.exe` são roteados pelo outbound Shadowsocks; o resto sai direto. Há também um proxy SOCKS/HTTP local em `127.0.0.1:1080` que força qualquer app apontado pra ele a sair pela proxy.
 
@@ -275,7 +281,7 @@ comando só, caso algo saia diferente do esperado.
 - **Precisa de Administrador** pra instalar e pra reverter (criar a TUN e a
   tarefa agendada). `monitor` e `logs` não precisam.
 - **A senha fica em texto puro** em `C:\Program Files\sing-box\config.json`
-  (só Administrador lê). Use `revert.ps1 -RemoveFiles` se quiser apagar.
+  (só Administrador lê). Use `revert-bypass.bat completo` se quiser apagar.
 - **Só os executáveis listados no `config.json`** saem pela proxy. Se o
   Discord mudar o nome do processo, edite a lista em `process_name` e rode
   `install-bypass.bat` de novo.
